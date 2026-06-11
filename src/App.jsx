@@ -1,7 +1,6 @@
-// This is a test comment to verify the main branch sync!
-// remove kofithr fee; unvle
-import { useState } from 'react'
-import { useAuth } from './hooks/useAuth'
+import { useState, useEffect } from 'react'
+import { useAuth } from './hooks/useAuth' 
+import { useProfile } from './hooks/useProfile'
 import { useDogs } from './hooks/useDogs'
 
 import Login from './Login'
@@ -10,67 +9,108 @@ import Feed from './components/Feed'
 import MapPanel from './components/MapPanel'
 import AddDogModal from './components/modals/AddDogModal'
 import ActivityModal from './components/modals/ActivityModal'
+import UserProfile from './components/UserProfile'
 
 export default function App() {
-  const session = useAuth()
-  const { dogs, addDog, loading } = useDogs(session)
+  const { user, loading } = useAuth()
+  const { profile: fetchedProfile } = useProfile(user?.id)
+  
+  // Local state to hold the profile data immediately on signup
+  const [signupProfile, setSignupProfile] = useState(null)
+
+  // Clear signup profile fallback if the user logs out
+  useEffect(() => {
+    if (!user) {
+      setSignupProfile(null)
+    }
+  }, [user])
+
+  // Single Source of Truth: Use the signup profile if it exists, otherwise fall back to fetched profile
+  const profile = signupProfile || fetchedProfile
+  
+  const { dogs, addDog, loading: dogsLoading } = useDogs(user, profile)
 
   const [isAddOpen, setIsAddOpen] = useState(false)
   const [isActivityOpen, setIsActivityOpen] = useState(false)
+  const [currentView, setCurrentView] = useState('feed') 
   const [radius, setRadius] = useState(5)
 
-  if (!session) return <Login />
+  // Sync radius state when profile maps coordinates/settings
+  useEffect(() => {
+    if (profile?.interest_radius_meters) {
+      setRadius(profile.interest_radius_meters / 1000)
+    }
+  }, [profile])
 
-  const myPack = dogs.filter(d => d.created_by === session.user.id)
+  // Clean loading state
+  if (loading) {
+    return <div style={{ padding: '50px', textAlign: 'center' }}>Loading WhatDaDogDoin... 🐾</div>
+  }
+
+  // Secure gate - Pass down setSignupProfile so Login/Signup can pass up new user data instantly
+  if (!user) {
+    return <Login onSignupComplete={(newProfile) => setSignupProfile(newProfile)} />
+  }
+
+  const myPack = dogs ? dogs.filter(d => d.created_by === user.id) : []
 
   return (
     <div style={layoutGridStyle}>
-      
-      {/* LEFT */}
-      <Sidebar user={session.user} />
+      {/* LEFT - Sidebar with user info */}
+      <Sidebar user={user} profile={profile} onProfileClick={() => setCurrentView('profile')} />
 
       {/* CENTER */}
       <main style={{ padding: '20px' }}>
+        {currentView === 'profile' ? (
+          <UserProfile
+            user={user}
+            profile={profile}
+            onClose={() => setCurrentView('feed')}
+          />
+        ) : (
+          <>
+            {/* MY PACK */}
+            <section style={{ marginBottom: '25px' }}>
+              <h3 style={sectionHeaderStyle}>My Pack</h3>
 
-        {/* MY PACK */}
-        <section style={{ marginBottom: '25px' }}>
-          <h3 style={sectionHeaderStyle}>My Pack</h3>
+              <div style={storyScrollContainer}>
+                <div style={addStoryCard} onClick={() => setIsAddOpen(true)}>+</div>
 
-          <div style={storyScrollContainer}>
-            <div style={addStoryCard} onClick={() => setIsAddOpen(true)}>+</div>
-
-            {myPack.map(dog => (
-              <div key={dog.id} style={storyCard}>
-                <img
-                  src={dog.main_image_url || 'https://via.placeholder.com/60'}
-                  style={storyAvatarStyle}
-                />
-                <span style={storyNameStyle}>{dog.name.split(' ')[0]}</span>
+                {myPack.map(dog => (
+                  <div key={dog.id} style={storyCard}>
+                    <img
+                      src={dog.main_image_url || 'https://via.placeholder.com/60'}
+                      style={storyAvatarStyle}
+                      alt={dog.name}
+                    />
+                    <span style={storyNameStyle}>{dog.name.split(' ')[0]}</span>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        </section>
+            </section>
 
-        {/* ACTIONS */}
-        <div style={actionRowStyle}>
-          <button onClick={() => setIsAddOpen(true)} style={primaryActionBtn}>
-            ➕ Report Sighting
-          </button>
-          <button onClick={() => setIsActivityOpen(true)} style={secondaryActionBtn}>
-            📝 Log Activity
-          </button>
-        </div>
+            {/* ACTIONS */}
+            <div style={actionRowStyle}>
+              <button onClick={() => setIsAddOpen(true)} style={primaryActionBtn}>
+                ➕ Report Sighting
+              </button>
+              <button onClick={() => setIsActivityOpen(true)} style={secondaryActionBtn}>
+                📝 Log Activity
+              </button>
+            </div>
 
-        {/* FEED */}
-        <Feed dogs={dogs} />
-
+            {/* FEED */}
+            <Feed dogs={dogs || []} />
+          </>
+        )}
       </main>
 
       {/* RIGHT */}
-      <aside style={rightSidebarStyle}>
+      {currentView !== 'profile' && (
+        <aside style={rightSidebarStyle}>
         <div style={{ position: 'sticky', top: '20px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
           
-          <MapPanel dogs={dogs} />
+          <MapPanel dogs={dogs || []} user={user} profile={profile} />
 
           {/* RADIUS */}
           <div style={cardStyle}>
@@ -91,28 +131,33 @@ export default function App() {
           <div style={cardStyle}>
             <h4 style={{ margin: '0 0 10px 0' }}>Nearby Legends</h4>
 
-            {dogs.slice(0, 3).map(dog => (
+            {(dogs || []).slice(0, 3).map(dog => (
               <div key={dog.id} style={nearbyItemStyle}>
-                <img src={dog.main_image_url} style={avatarSmallStyle} />
+                <img src={dog.main_image_url || 'https://via.placeholder.com/35'} style={avatarSmallStyle} alt={dog.name} />
                 <span>{dog.name}</span>
               </div>
             ))}
           </div>
         </div>
       </aside>
+      )}
 
       {/* MODALS */}
       {isAddOpen && (
         <AddDogModal
           onClose={() => setIsAddOpen(false)}
           onSubmit={addDog}
-          userId={session.user.id}
-          loading={loading}
+          userId={user.id}
+          loading={dogsLoading}
         />
       )}
 
       {isActivityOpen && (
-        <ActivityModal onClose={() => setIsActivityOpen(false)} />
+        <ActivityModal 
+          dogs={dogs || []}
+          userId={user.id}
+          onClose={() => setIsActivityOpen(false)}
+        />
       )}
     </div>
   )
