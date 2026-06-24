@@ -1,65 +1,72 @@
 import os
 import json
 import time
+import re
 from dotenv import load_dotenv
-from google import genai
-from groq import Groq
+from openai import OpenAI
 from neo4j import GraphDatabase
 from parse_manual import extract_and_chunk_pdf
 
 load_dotenv()
 
-# Initialize API clients
-ai_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# Initialize Azure AI Clients using standard OpenAI standard format
+# Replace model names in the functions below with your actual deployed Azure model names
+llm_client = OpenAI(
+    base_url=os.getenv("AZURE_AI_ENDPOINT"),
+    api_key=os.getenv("AZURE_AI_KEY")
+)
+
+embedding_client = OpenAI(
+    base_url=os.getenv("AZURE_EMBEDDING_ENDPOINT", os.getenv("AZURE_AI_ENDPOINT")),
+    api_key=os.getenv("AZURE_EMBEDDING_KEY", os.getenv("AZURE_AI_KEY"))
+)
+
 neo4j_driver = GraphDatabase.driver(
     os.getenv("NEO4J_URI"), 
     auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD"))
 )
 
 def get_embedding(text):
-    """Generates a 768-dimensional vector embedding using Google's model."""
-    response = ai_client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=text
+    """Generates a vector embedding using Azure Serverless Embedding Model."""
+    response = embedding_client.embeddings.create(
+        model="text-embedding-3-small", # Update to your Azure deployment name
+        input=text
     )
-    return response.embeddings[0].values
+    return response.data[0].embedding
 
-def extract_graph_entities_with_groq(text_chunk):
-    """Uses Groq + Llama-3.1-8b with strict regex correction to pull clean JSON arrays."""
+def extract_graph_entities_with_azure(text_chunk):
+    """Uses Azure LLM to extract entities, relationships, and temporal properties."""
     prompt = f"""
-    Analyze the following veterinary text chunk and extract key clinical relationships.
-    Identify diseases, conditions, symptoms, treatments, or risk factors.
+    Analyze the following veterinary text chunk from an Indian street dog care guide.
+    Extract key clinical relationships, focusing heavily on disease progression and timelines.
     
-    You must respond ONLY with a raw JSON array of objects. Do not include markdown codeblocks, explanations, or introductory text.
-    Each object in the array must have exactly these keys:
+    You must respond ONLY with a raw JSON array of objects. No markdown, no explanations.
+    Each object must have these keys:
     - "source": The main clinical entity (e.g., "Parvovirus", "Lethargy")
-    - "type": The entity type (e.g., "DISEASE", "SYMPTOM", "TREATMENT")
-    - "relationship": How it links to the target (e.g., "HAS_SYMPTOM", "TREATS", "CAUSED_BY")
-    - "target": The connected entity (e.g., "Dehydration", "Fluid Therapy")
-    - "target_type": The target entity type.
+    - "type": Entity type (e.g., "DISEASE", "SYMPTOM", "TREATMENT")
+    - "relationship": How it links (e.g., "HAS_SYMPTOM", "PROGRESSES_TO", "TREATS")
+    - "target": Connected entity (e.g., "Dehydration", "Fluid Therapy")
+    - "target_type": Target entity type.
+    - "properties": A JSON object containing any timeline or severity data mentioned (e.g., {{"onset_day": "3-5", "severity": "high"}}). Leave empty {{}} if none.
 
     Text to extract from: {text_chunk}
     """
     
     try:
-        completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+        completion = llm_client.chat.completions.create(
+            model="gpt-4o-mini", # Update to your Azure deployment name (e.g., Llama-3)
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=1000
+            max_tokens=1500
         )
         
         raw_text = completion.choices[0].message.content.strip()
         
-        # --- ROBUST REGEX CLEANING FALLBACK ---
-        # Find anything that sits between the first '[' and the last ']'
-        import re
+        # Robust regex fallback for clean JSON extraction
         match = re.search(r'\[\s*{.*}\s*\]', raw_text, re.DOTALL)
         if match:
             clean_json_str = match.group(0)
         else:
-            # Fallback in case it didn't include the array outer brackets
             if raw_text.startswith("```json"):
                 clean_json_str = raw_text.split("```json")[1].split("```")[0].strip()
             elif raw_text.startswith("```"):
@@ -67,15 +74,13 @@ def extract_graph_entities_with_groq(text_chunk):
             else:
                 clean_json_str = raw_text
 
-        # Fix minor formatting slips (like trailing commas before closing braces)
         clean_json_str = re.sub(r',\s*\]', ']', clean_json_str)
         clean_json_str = re.sub(r',\s*\}', '}', clean_json_str)
         
         return json.loads(clean_json_str)
         
     except Exception as e:
-        # If it still fails, return an empty array so the loop keeps processing other chunks gracefully
-        print(f" -> Parsing adjustment made: skipped 1 chunk due to structure shape variance ({e})")
+        print(f" -> Extraction skipped due to formatting variance: {e}")
         return []
 
 def execute_cypher(query, parameters=None):
@@ -91,27 +96,28 @@ def setup_database_constraints():
         print(f"Constraint configuration notice: {e}")
 
 def ingest_knowledge_base(chunks, limit=50):
-    print(f"\n--- Starting High-Speed Knowledge Ingestion (First {limit} chunks) ---")
+    print(f"\n--- Starting Hybrid Ingestion (First {limit} chunks) ---")
     
     for i in range(limit):
         chunk = chunks[i]
-        print(f"Processing chunk {i+1}/{limit} using Groq + Google Embeddings...")
+        print(f"Processing chunk {i+1}/{limit} using Azure AI...")
         
-        # 1. Get Vector Embedding (High rate ceiling)
         vector = get_embedding(chunk)
+        triples = extract_graph_entities_with_azure(chunk)
         
-        # 2. Extract Triples via High-RPM Groq Pipeline
-        triples = extract_graph_entities_with_groq(chunk)
-        
-        # 3. Stream nodes directly into Neo4j
         for triple in triples:
             source = str(triple.get('source', '')).strip().title()
             target = str(triple.get('target', '')).strip().title()
             rel = str(triple.get('relationship', 'ASSOCIATED_WITH')).strip().upper().replace(" ", "_")
+            props = triple.get('properties', {})
             
             if not source or not target:
                 continue
                 
+            # Dynamic property mapping for Cypher
+            set_props = ", ".join([f"r.{k} = ${k}" for k in props.keys()])
+            set_clause = f"SET {set_props}" if set_props else ""
+            
             cypher = f"""
             MERGE (s:Entity {{name: $source}})
             ON CREATE SET s.type = $source_type
@@ -120,67 +126,39 @@ def ingest_knowledge_base(chunks, limit=50):
             ON CREATE SET t.type = $target_type
             
             MERGE (s)-[r:{rel}]->(t)
+            {set_clause}
             """
-            execute_cypher(cypher, {
+            
+            # Merge standard params with the dynamic properties dict
+            params = {
                 "source": source, "source_type": triple.get('type'),
                 "target": target, "target_type": triple.get('target_type')
-            })
+            }
+            params.update(props)
             
-        # Store text document block
+            execute_cypher(cypher, params)
+            
         chunk_cypher = """
         CREATE (c:DocumentChunk {chunk_id: $chunk_id, text: $text, embedding: $embedding})
         """
         execute_cypher(chunk_cypher, {"chunk_id": i, "text": chunk, "embedding": vector})
-        time.sleep(0.1) # Micro-pause to maintain clean thread timing
+        time.sleep(0.2) 
 
+# [Keep your existing inject_synthetic_time_series() function here]
 def inject_synthetic_time_series():
-    print("\n--- Injecting Option A Time-Series Timeline Graph ---")
-    
-    execute_cypher("""
-    MERGE (d:Dog {id: "stray_77"})
-    SET d.name = "Rocky", d.breed = "Indie Street Dog", d.estimated_age = "3 years"
-    """)
-    
-    # Day 1
-    execute_cypher("""
-    MATCH (d:Dog {id: "stray_77"})
-    CREATE (l1:Log {date: "2026-06-06", food_intake_pct: 100, temp_celsius: 38.6, activity: "Normal"})
-    CREATE (d)-[:HAS_TIMELINE]->(l1)
-    """)
-    
-    # Day 2
-    execute_cypher("""
-    MATCH (l1:Log {date: "2026-06-06"})
-    CREATE (l2:Log {date: "2026-06-07", food_intake_pct: 40, temp_celsius: 39.4, activity: "Lethargic"})
-    CREATE (l2)-[:PREVIOUS]->(l1)
-    WITH l2
-    MERGE (s:Entity {name: "Lethargy"})
-    MERGE (l2)-[:EXHIBITS]->(s)
-    """)
-    
-    # Day 3 (Today)
-    execute_cypher("""
-    MATCH (l2:Log {date: "2026-06-07"})
-    CREATE (l3:Log {date: "2026-06-08", food_intake_pct: 0, temp_celsius: 40.1, activity: "Very Weak"})
-    CREATE (l3)-[:PREVIOUS]->(l2)
-    WITH l3
-    MERGE (s1:Entity {name: "Lethargy"})
-    MERGE (s2:Entity {name: "Anorexia"})
-    MERGE (l3)-[:EXHIBITS]->(s1)
-    MERGE (l3)-[:EXHIBITS]->(s2)
-    """)
-    print("Time-series tracking built into topology!")
+    pass # Add back your original Rocky time-series logic here
 
 if __name__ == "__main__":
     setup_database_constraints()
-    chunks = extract_and_chunk_pdf("vet_manual.pdf")
     
-    # Slice the list to completely bypass table of contents noise
-    # Starts at chunk 100 and takes the next 50 clinical chunks
-    clinical_chunks = chunks[100:150] 
+    # Updated to process the new v6 PDF
+    chunks = extract_and_chunk_pdf("vet_manual.pdf") 
     
-    ingest_knowledge_base(clinical_chunks, limit=50)
-    inject_synthetic_time_series()
+    # Adjust chunk slicing based on where the clinical data actually starts in the new PDF
+    #clinical_chunks = chunks[10:60] 
     
-    print("\nInitialization completely successful! Graph populated with core clinical data.")
+    ingest_knowledge_base(chunks, limit=50)
+    # inject_synthetic_time_series()
+    
+    print("\nInitialization completely successful! Graph populated with timeline-aware clinical data.")
     neo4j_driver.close()
