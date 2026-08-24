@@ -4,21 +4,21 @@ import time
 import re
 from dotenv import load_dotenv
 from openai import OpenAI
+from openai import AzureOpenAI
 from neo4j import GraphDatabase
 from parse_manual import extract_and_chunk_pdf
 
 load_dotenv()
 
-# Initialize Azure AI Clients using standard OpenAI standard format
-# Replace model names in the functions below with your actual deployed Azure model names
 llm_client = OpenAI(
-    base_url=os.getenv("AZURE_AI_ENDPOINT"),
-    api_key=os.getenv("AZURE_AI_KEY")
+    base_url="https://api.groq.com/openai/v1",
+    api_key=os.getenv("GROQ_API_KEY")
 )
 
 embedding_client = OpenAI(
-    base_url=os.getenv("AZURE_EMBEDDING_ENDPOINT", os.getenv("AZURE_AI_ENDPOINT")),
-    api_key=os.getenv("AZURE_EMBEDDING_KEY", os.getenv("AZURE_AI_KEY"))
+    base_url=os.getenv("AZURE_EMBEDDING_ENDPOINT"),
+    api_key=os.getenv("AZURE_EMBEDDING_KEY"),
+    # Optionally add default headers or timeout
 )
 
 neo4j_driver = GraphDatabase.driver(
@@ -29,13 +29,13 @@ neo4j_driver = GraphDatabase.driver(
 def get_embedding(text):
     """Generates a vector embedding using Azure Serverless Embedding Model."""
     response = embedding_client.embeddings.create(
-        model="text-embedding-3-small", # Update to your Azure deployment name
+        model=os.getenv("AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-3-small"),
         input=text
     )
     return response.data[0].embedding
 
 def extract_graph_entities_with_azure(text_chunk):
-    """Uses Azure LLM to extract entities, relationships, and temporal properties."""
+    """Uses Azure phi-4-mini-instruct to extract entities, relationships, and temporal properties."""
     prompt = f"""
     Analyze the following veterinary text chunk from an Indian street dog care guide.
     Extract key clinical relationships, focusing heavily on disease progression and timelines.
@@ -54,16 +54,17 @@ def extract_graph_entities_with_azure(text_chunk):
     
     try:
         completion = llm_client.chat.completions.create(
-            model="gpt-4o-mini", # Update to your Azure deployment name (e.g., Llama-3)
+            model="llama-3.3-70b-versatile",                    # Best quality
+            # model="grok-3-mini"              # Faster + cheaper alternative
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
+            temperature=0.0,
             max_tokens=1500
         )
         
         raw_text = completion.choices[0].message.content.strip()
         
         # Robust regex fallback for clean JSON extraction
-        match = re.search(r'\[\s*{.*}\s*\]', raw_text, re.DOTALL)
+        match = re.search(r'\[\s*\{.*\}\s*\]', raw_text, re.DOTALL)
         if match:
             clean_json_str = match.group(0)
         else:
@@ -151,13 +152,19 @@ def inject_synthetic_time_series():
 if __name__ == "__main__":
     setup_database_constraints()
     
-    # Updated to process the new v6 PDF
-    chunks = extract_and_chunk_pdf("vet_manual.pdf") 
+    chunks = extract_and_chunk_pdf("vet_manual.pdf")
+    
+    if not chunks:
+        print("No chunks extracted! Check the PDF and chunking logic.")
+    else:
+        limit = min(50, len(chunks))
+        print(f"Processing first {limit} chunks...")
+        ingest_knowledge_base(chunks, limit=limit)
     
     # Adjust chunk slicing based on where the clinical data actually starts in the new PDF
     #clinical_chunks = chunks[10:60] 
     
-    ingest_knowledge_base(chunks, limit=50)
+    #ingest_knowledge_base(chunks, limit=min(50, len(chunks)))
     # inject_synthetic_time_series()
     
     print("\nInitialization completely successful! Graph populated with timeline-aware clinical data.")
